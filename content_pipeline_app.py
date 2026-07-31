@@ -327,19 +327,9 @@ def get_db():
     return conn
 
 def init_db():
+    # Note: pieces table DDL removed in Commit C.
+    # The pieces table still exists in the DB for historical data but is no longer managed here.
     with get_db() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS pieces (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created TEXT, module TEXT, idea TEXT,
-            hook TEXT, hook_type TEXT,
-            title TEXT, cover TEXT, script TEXT, cta TEXT,
-            storyboard TEXT, template_used TEXT,
-            completion REAL, saves INTEGER, followers INTEGER, why TEXT
-        )""")
-        for col in ["storyboard", "template_used"]:
-            try: conn.execute(f"ALTER TABLE pieces ADD COLUMN {col} TEXT")
-            except: pass
-
         conn.execute("""CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created TEXT, source_label TEXT, raw_text TEXT,
@@ -424,38 +414,60 @@ def insert_artifact(a: dict) -> str:
 
 
 def fetch_artifacts():
+    """Fetch all artifacts with summary stats and hook_text from content_artifacts."""
     with get_db() as conn:
         return conn.execute(
-            "SELECT * FROM v_artifact_summary ORDER BY publish_time DESC NULLS LAST, artifact_id DESC"
+            """SELECT
+                v.*,
+                a.hook_text,
+                a.cta,
+                a.language,
+                a.notes
+               FROM v_artifact_summary v
+               JOIN content_artifacts a ON a.artifact_id = v.artifact_id
+               ORDER BY v.publish_time DESC, v.artifact_id DESC"""
         ).fetchall()
 
 
-# LEGACY (to be removed in Commit C)
-def insert_piece(p):
+def fetch_snapshots(artifact_id: str):
+    """Fetch all performance snapshots for an artifact, newest first."""
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT * FROM performance_snapshots "
+            "WHERE artifact_id = ? ORDER BY captured_at DESC",
+            (artifact_id,)
+        ).fetchall()
+
+
+def insert_snapshot(s: dict):
+    """
+    Append a new performance snapshot. Never updates existing rows.
+    captured_at is always set to now — this is a point-in-time record.
+    """
+    from datetime import datetime, timezone
+    captured_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO pieces (created,module,idea,hook,hook_type,title,cover,script,cta,storyboard,template_used) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (date.today().isoformat(), p["module"], p["idea"],
-             p["hook"], p["hook_type"], p["title"], p["cover"],
-             p["script"], p["cta"], p.get("storyboard",""), p.get("template_used","")),
+            """INSERT INTO performance_snapshots (
+                artifact_id, captured_at, views,
+                likes, comments, shares, saves, followers_gained,
+                watch_time, average_watch_time, retention_rate, completion_rate,
+                impressions, engagements
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                s["artifact_id"], captured_at, s["views"],
+                s.get("likes"),       s.get("comments"),
+                s.get("shares"),      s.get("saves"),
+                s.get("followers_gained"),
+                s.get("watch_time"),  s.get("average_watch_time"),
+                s.get("retention_rate"), s.get("completion_rate"),
+                s.get("impressions"), s.get("engagements"),
+            )
         )
 
-def update_stats(pid, completion, saves, followers, why):
-    with get_db() as conn:
-        conn.execute("UPDATE pieces SET completion=?,saves=?,followers=?,why=? WHERE id=?",
-                     (completion, saves, followers, why, pid))
 
-def delete_piece(pid):
-    with get_db() as conn:
-        conn.execute("DELETE FROM pieces WHERE id=?", (pid,))
-
-def fetch_pieces(order):
-    col = "saves" if order == "收藏数" else "completion"
-    with get_db() as conn:
-        return conn.execute(
-            f"SELECT * FROM pieces ORDER BY ({col} IS NULL), {col} DESC, id DESC"
-        ).fetchall()
+# pieces functions removed in Commit C.
+# The pieces table remains in the DB (not dropped) to preserve historical data.
 
 def insert_signal(sig, source_label, raw_text, velocity=None):
     with get_db() as conn:
@@ -650,7 +662,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_sig, tab_tmpl, tab_pipe, tab_mem = st.tabs(["信号收集", "模版库", "流水线", "记忆库"])
+tab_sig, tab_tmpl, tab_pipe, tab_mem = st.tabs(["信号收集", "模版库", "流水线", "Content Library"])
 
 # ===== SIGNAL COLLECTOR =====
 with tab_sig:
@@ -1032,34 +1044,156 @@ with tab_pipe:
                 }
         # ── End Artifact Review ────────────────────────────────────────────
 
-# ===== MEMORY =====
+# ===== CONTENT LIBRARY =====
 with tab_mem:
-    order = st.selectbox("排序", ["收藏数", "完播率"])
-    rows = fetch_pieces(order)
-    if not rows:
-        st.info("记忆库空的。做完→发→回来填数据。")
+    st.caption("已发布 Artifact · 点击展开回填 Performance Snapshot")
+    artifacts = fetch_artifacts()
+    if not artifacts:
+        st.info("还没有 Artifact。完成流水线并创建第一个 Artifact 后会出现在这里。")
     else:
-        for r in rows:
+        for a in artifacts:
             with st.container(border=True):
-                c1,c2 = st.columns([5,1])
-                c1.markdown(f"**{r['title']}**"); c2.caption(r["created"])
-                st.caption(f"`{r['module']}` · [{r['hook_type'] or ''}] {r['hook']}")
-                if r["completion"] is not None or r["saves"] is not None or r["followers"] is not None:
-                    m1,m2,m3 = st.columns(3)
-                    m1.metric("完播率", f"{r['completion']}%" if r["completion"] is not None else "—")
-                    m2.metric("收藏", r["saves"] if r["saves"] is not None else "—")
-                    m3.metric("涨粉", r["followers"] if r["followers"] is not None else "—")
-                    if r["why"]: st.caption(f"为什么：{r['why']}")
-                with st.expander("回填数据"):
-                    f1,f2,f3 = st.columns(3)
-                    comp = f1.number_input("完播率%", value=float(r["completion"] or 0), step=0.1, key=f"c{r['id']}")
-                    sav  = f2.number_input("收藏", value=int(r["saves"] or 0), step=1, key=f"s{r['id']}")
-                    fol  = f3.number_input("涨粉", value=int(r["followers"] or 0), step=1, key=f"f{r['id']}")
-                    why  = st.text_area("这条证明了什么", value=r["why"] or "", key=f"w{r['id']}", height=70)
-                    b1,b2 = st.columns(2)
-                    if b1.button("保存", key=f"sv{r['id']}"): update_stats(r["id"],comp,int(sav),int(fol),why.strip()); st.rerun()
-                    if b2.button("删除", key=f"dl{r['id']}"): delete_piece(r["id"]); st.rerun()
-                with st.expander("脚本"): st.text(r["script"])
-                sb = r["storyboard"] if "storyboard" in r.keys() else ""
-                if sb:
-                    with st.expander("分镜"): st.text(sb)
+                # ── Artifact header ──────────────────────────────────────
+                h1, h2 = st.columns([5, 1])
+                h1.markdown(
+                    f"**`{a['artifact_id']}`**  "
+                    f"· `{a['topic_type']}` · `{a['structure']}` · `{a['platform']}`"
+                )
+                h2.caption(a["publish_time"] or "未发布")
+
+                st.caption(
+                    f"[{a['hook_pattern']}] {a['hook_text'] or '—'}"
+                )
+
+                # ── Latest snapshot summary ──────────────────────────────
+                if a["snapshot_count"] and a["snapshot_count"] > 0:
+                    s1, s2, s3, s4 = st.columns(4)
+                    peak_views_display = (
+                        a["peak_views"] if a["peak_views"] is not None else "—"
+                    )
+                    peak_saves_display = (
+                        a["peak_saves"] if a["peak_saves"] is not None else "—"
+                    )
+                    peak_completion_display = (
+                        f"{a['peak_completion_rate']:.0%}"
+                        if a["peak_completion_rate"] is not None else "—"
+                    )
+                    s1.metric("Peak Views",      peak_views_display)
+                    s2.metric("Peak Saves",      peak_saves_display)
+                    s3.metric("Peak Completion", peak_completion_display)
+                    s4.metric("Snapshots",     a["snapshot_count"])
+                    st.caption(f"Latest snapshot: {a['latest_snapshot']}")
+                else:
+                    st.caption("还没有 Performance Snapshot")
+
+                # ── Add Performance Snapshot ─────────────────────────────
+                with st.expander("＋ 添加 Performance Snapshot"):
+                    st.caption(
+                        "每次回填都新增一条记录，保留增长轨迹。"
+                        "不填的指标留空（平台未提供 ≠ 0）。"
+                    )
+                    def _opt_int(label, key):
+                        """
+                        Blank → (None, True)   = Unknown, valid
+                        Zero  → (0,    True)   = explicit zero, valid
+                        n     → (n,    True)   = value, valid
+                        bad   → (None, False)  = invalid, blocks save
+                        """
+                        raw = st.text_input(label, key=key, placeholder="留空 = 未采集")
+                        if not raw.strip():
+                            return None, True
+                        try:
+                            v = int(raw)
+                        except ValueError:
+                            st.error(f"{label} 必须是整数。")
+                            return None, False
+                        if v < 0:
+                            st.error(f"{label} 不能小于 0。")
+                            return None, False
+                        return v, True
+
+                    def _opt_rate(label, key):
+                        """
+                        Blank → (None,  True)  = Unknown, valid
+                        0.0   → (0.0,   True)  = explicit zero, valid
+                        n     → (n,     True)  = value, valid
+                        bad   → (None,  False) = invalid, blocks save
+                        """
+                        raw = st.text_input(label, key=key, placeholder="留空 = 未采集；范围 0–1")
+                        if not raw.strip():
+                            return None, True
+                        try:
+                            v = float(raw)
+                        except ValueError:
+                            st.error(f"{label} 必须是数字。")
+                            return None, False
+                        if not 0.0 <= v <= 1.0:
+                            st.error(f"{label} 必须在 0–1 之间。")
+                            return None, False
+                        return v, True
+
+                    pa, pb = st.columns(2)
+                    views = pa.number_input(
+                        "Views *", min_value=0, step=1, key=f"v_{a['artifact_id']}"
+                    )
+                    with pb:
+                        saves, saves_ok = _opt_int("Saves", f"sv_{a['artifact_id']}")
+                    pc, pd = st.columns(2)
+                    with pc:
+                        likes, likes_ok       = _opt_int("Likes",    f"lk_{a['artifact_id']}")
+                    with pd:
+                        comments, comments_ok = _opt_int("Comments", f"cm_{a['artifact_id']}")
+                    pe, pf = st.columns(2)
+                    with pe:
+                        shares, shares_ok     = _opt_int("Shares",   f"sh_{a['artifact_id']}")
+                    with pf:
+                        followers_gained, followers_ok = _opt_int(
+                            "Followers Gained", f"fg_{a['artifact_id']}"
+                        )
+                    pg, ph = st.columns(2)
+                    with pg:
+                        completion_rate, completion_ok = _opt_rate(
+                            "Completion Rate (0–1)", f"cr_{a['artifact_id']}"
+                        )
+                    with ph:
+                        retention_rate, retention_ok = _opt_rate(
+                            "Retention Rate (0–1)", f"rr_{a['artifact_id']}"
+                        )
+                    form_valid = all([
+                        saves_ok, likes_ok, comments_ok, shares_ok,
+                        followers_ok, completion_ok, retention_ok,
+                    ])
+
+                    if st.button("保存 Snapshot", key=f"snap_{a['artifact_id']}", disabled=not form_valid):
+                        insert_snapshot({
+                            "artifact_id":       a["artifact_id"],
+                            "views":             int(views),
+                            "saves":             saves,
+                            "likes":             likes,
+                            "comments":          comments,
+                            "shares":            shares,
+                            "followers_gained":  followers_gained,
+                            "completion_rate":   completion_rate,
+                            "retention_rate":    retention_rate,
+                        })
+                        st.success("Snapshot 已保存。")
+                        st.rerun()
+
+                # ── Snapshot history ─────────────────────────────────────
+                snaps = fetch_snapshots(a["artifact_id"])
+                if snaps and len(snaps) > 1:
+                    with st.expander(f"Snapshot 历史（{len(snaps)} 条）"):
+                        for sn in snaps:
+                            completion_display = (
+                                f"{sn['completion_rate']:.0%}"
+                                if sn["completion_rate"] is not None else "—"
+                            )
+                            saves_display = (
+                                str(sn["saves"]) if sn["saves"] is not None else "—"
+                            )
+                            st.caption(
+                                f"{sn['captured_at']}  "
+                                f"views={sn['views']}  "
+                                f"saves={saves_display}  "
+                                f"completion={completion_display}"
+                            )
