@@ -26,6 +26,10 @@ MODEL = "claude-sonnet-4-6"
 # DB_PATH and SCORER_MODEL are defined centrally in pipeline/settings.py.
 # This app imports them directly — do not redefine here.
 from pipeline.settings import DB_PATH
+from pipeline.constants import (
+    TOPIC_TYPES, STRUCTURES, HOOK_PATTERNS, HOOK_PATTERN_DEFINITIONS,
+    PLATFORMS, FORMATS,
+)
 
 # ⬇️ 你的内容方向，所有 prompt 都引用这个变量
 CONTENT_DIRECTION = """
@@ -72,7 +76,9 @@ HOOK_SYS = f"""你给一个有真实创业和运营经验的中国创业者写�
 - 你每天重复做的那件事，正在被 Agent 替掉。
 - 这个政策不是利好，是淘汰加速器。
 
-只输出 JSON 数组，不要任何解释或 markdown 代码块。"""
+只输出 JSON 数组，不要任何解释或 markdown 代码块。
+`type` 字段必须从以下枚举值中选一个（直接输出英文值，不要翻译）：
+{HOOK_PATTERN_DEFINITIONS}"""
 
 SCRIPT_SYS = f"""你给一个有真实创业和运营经验的中国创业者写 45-60 秒短视频口播稿。
 
@@ -352,6 +358,79 @@ def init_db():
             original_text TEXT
         )""")
 
+def _next_content_id() -> str:
+    """Generate next content_id in CNT-YYYY-NNN format.
+    Derived from content_id column — never from artifact_id.
+    """
+    import datetime
+    year = datetime.date.today().year
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT content_id FROM content_artifacts "
+            "WHERE content_id LIKE ? "
+            "ORDER BY content_id DESC LIMIT 1",
+            (f"CNT-{year}-%",)
+        ).fetchone()
+    if row:
+        last_seq = int(row["content_id"].split("-")[2])
+        seq = last_seq + 1
+    else:
+        seq = 1
+    return f"CNT-{year}-{seq:03d}"
+
+
+def _platform_code(platform: str) -> str:
+    mapping = {"xiaohongshu": "XHS", "instagram": "IG"}
+    if platform not in mapping:
+        raise ValueError(f"Unknown platform '{platform}'. Add it to constants.PLATFORMS and _platform_code().")
+    return mapping[platform]
+
+
+def insert_artifact(a: dict) -> str:
+    """
+    Insert a content artifact. Generates content_id and artifact_id.
+    Returns the artifact_id.
+    a must contain all Required fields from Schema v1.0:
+      platform, format, topic_type, structure, hook_pattern, hook_text
+    Optional: secondary_topics, length, cta, series, language, publish_time, notes
+    """
+    content_id = _next_content_id()
+    platform_code = _platform_code(a["platform"])
+    artifact_id = f"{content_id}-{platform_code}-01"
+
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO content_artifacts (
+                artifact_id, content_id, platform, format,
+                topic_type, structure, hook_pattern, hook_text,
+                secondary_topics, length, cta, series,
+                language, publish_time, notes
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                artifact_id, content_id,
+                a["platform"], a["format"],
+                a["topic_type"], a["structure"],
+                a["hook_pattern"], a["hook_text"],
+                a.get("secondary_topics"),
+                a.get("length"),
+                a.get("cta"),
+                a.get("series"),
+                a.get("language", "zh"),
+                a.get("publish_time"),
+                a.get("notes"),
+            )
+        )
+    return artifact_id
+
+
+def fetch_artifacts():
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT * FROM v_artifact_summary ORDER BY publish_time DESC NULLS LAST, artifact_id DESC"
+        ).fetchall()
+
+
+# LEGACY (to be removed in Commit C)
 def insert_piece(p):
     with get_db() as conn:
         conn.execute(
@@ -543,7 +622,16 @@ def ss():
     for k, v in {"stage": 1, "idea": "", "module": MODULES[0], "hooks": [],
                  "sel": 0, "script": None, "storyboard": "", "sig_raw": "",
                  "sig_source": "", "sig_results": [], "chosen_template": "",
-                 "tmpl_text": "", "tmpl_results": None, "recs": []}.items():
+                 "tmpl_text": "", "tmpl_results": None, "recs": [],
+                 # Artifact being built through the pipeline
+                 "artifact": {
+                     "topic_type": TOPIC_TYPES[0],
+                     "platform": PLATFORMS[0],
+                     "format": "video_short",
+                     "structure": "process",
+                     "hook_pattern": None,
+                     "hook_text": "",
+                 }}.items():
         s.setdefault(k, v)
     return s
 
@@ -654,12 +742,12 @@ with tab_tmpl:
 
     if tmpl_input == "🔗 链接":
         tmpl_url = st.text_input("链接", placeholder="https://www.instagram.com/reel/... 或小红书链接")
-        PLATFORMS = ["Instagram", "小红书", "TikTok", "YouTube", "其他"]
-        tmpl_platform = st.selectbox("平台", PLATFORMS)
+        TMPL_PLATFORMS = ["Instagram", "小红书", "TikTok", "YouTube", "其他"]
+        tmpl_platform = st.selectbox("平台", TMPL_PLATFORMS)
         st.caption("⚠️ 社交媒体链接经常需要登录才能抓取。如果抓取失败，下面可以补贴文案内容。")
     else:
-        PLATFORMS = ["Instagram", "小红书", "TikTok", "YouTube", "其他"]
-        tmpl_platform = st.selectbox("平台", PLATFORMS, key="tp2")
+        TMPL_PLATFORMS = ["Instagram", "小红书", "TikTok", "YouTube", "其他"]
+        tmpl_platform = st.selectbox("平台", TMPL_PLATFORMS, key="tp2")
 
     s.tmpl_text = st.text_area(
         "文案内容（视频口播稿 / 帖子正文 / caption）",
@@ -741,14 +829,35 @@ with tab_pipe:
         placeholder="一个想法、一个运营问题、或从信号库推过来的选题")
     s.module = st.radio("模块", MODULES, horizontal=True, index=MODULES.index(s.module))
 
+    # ── Intent Metadata (Layer 1) ──────────────────────────────────────────
+    # Captured at start of pipeline — these are known before writing begins.
+    with st.expander("Intent Metadata", expanded=True):
+        ic1, ic2, ic3 = st.columns(3)
+        s.artifact["topic_type"] = ic1.selectbox(
+            "Topic Type",
+            TOPIC_TYPES,
+            index=TOPIC_TYPES.index(s.artifact.get("topic_type", TOPIC_TYPES[0])),
+        )
+        s.artifact["platform"] = ic2.selectbox(
+            "Platform",
+            PLATFORMS,
+            index=PLATFORMS.index(s.artifact.get("platform", PLATFORMS[0])),
+        )
+        s.artifact["format"] = ic3.selectbox(
+            "Format",
+            FORMATS,
+            index=FORMATS.index(s.artifact.get("format", "video_short")),
+        )
+    # ── End Intent Metadata ────────────────────────────────────────────────
+
     if st.button("① 生成 Hook", type="primary"):
         if not s.idea.strip(): st.warning("先写选题。")
         else:
             with st.spinner("生成 hook…"):
                 try:
                     out = call_claude(HOOK_SYS,
-                        f'生成 6 个 hook。JSON 数组：[{{"hook":"...","type":"类型"}}]。'
-                        f'type 2-4 字中文。每个 hook ≤35 字。\n\n内容：{s.idea}\n模块：{s.module}')
+                        f'生成 6 个 hook。JSON 数组：[{{"hook":"...","type":"<schema_enum>"}}]。'
+                        f'type 必须输出 Schema enum 值（见 Prompt 定义）。每个 hook ≤35 字。\n\n内容：{s.idea}\n模块：{s.module}')
                     s.hooks = extract_hooks(out); s.sel=0; s.script=None; s.storyboard=""; s.recs=[]
                     s.chosen_template = ""
                     if not s.hooks:
@@ -763,6 +872,14 @@ with tab_pipe:
                             h["rationale"] = result["rationale"]
                             scored.append(h)
                         s.hooks = scored
+                        # Update artifact with hook data from selected hook (index 0 initially)
+                        # Will be refreshed when user selects a different hook
+                        if scored:
+                            best = scored[0]
+                            s.artifact["hook_text"] = best["hook"]
+                            s.artifact["hook_pattern"] = (
+                                best["type"] if best.get("type") in HOOK_PATTERNS else None
+                            )
                 except Exception as e: st.error(f"失败：{e}")
 
     if s.hooks:
@@ -777,6 +894,11 @@ with tab_pipe:
             h = s.hooks[s.sel]
             if h.get("rationale"):
                 st.caption(f"💡 {h['rationale']}")
+            # Keep artifact in sync with selected hook
+            s.artifact["hook_text"] = h["hook"]
+            s.artifact["hook_pattern"] = (
+                h.get("type") if h.get("type") in HOOK_PATTERNS else None
+            )
 
         all_tmpls = fetch_templates()
         if all_tmpls:
@@ -852,18 +974,63 @@ with tab_pipe:
         storyboard = st.text_area("分镜方案", value=s.storyboard, height=420)
         s.storyboard = storyboard
         st.markdown("---")
-        if st.button("④ 存入记忆库", type="primary"):
-            insert_piece({
-                "module": s.module, "idea": s.idea,
-                "hook": s.hooks[s.sel]["hook"], "hook_type": s.hooks[s.sel]["type"],
-                "title": s.script["title"], "cover": s.script["cover"],
-                "script": s.script["script"], "cta": s.script["cta"],
-                "storyboard": s.storyboard,
-                "template_used": s.chosen_template[:200] if s.chosen_template else "",
-            })
-            st.success("已入库。去拍。发完回来填数据。")
-            s.stage=1; s.idea=""; s.hooks=[]; s.script=None; s.storyboard=""
-            s.chosen_template=""; s.recs=[]
+
+        # ── Artifact Review (Layer 2) ──────────────────────────────────────
+        # Metadata confirmed after creation. Auto-populated from pipeline;
+        # user confirms structure and resolves any missing hook_pattern.
+        st.caption("④ Artifact Review")
+        with st.container(border=True):
+            rc1, rc2 = st.columns(2)
+
+            # Structure: default to "process"; user confirms.
+            # Evidence-based recommendation deferred to Commit C.
+            current_structure = s.artifact.get("structure", "process")
+            if current_structure not in STRUCTURES:
+                current_structure = "process"
+            s.artifact["structure"] = rc1.selectbox(
+                "Structure",
+                STRUCTURES,
+                index=STRUCTURES.index(current_structure),
+            )
+
+            # hook_pattern: auto from hook type, fallback to selectbox
+            current_pattern = s.artifact.get("hook_pattern")
+            pattern_valid = current_pattern in HOOK_PATTERNS
+            if pattern_valid:
+                rc2.markdown(f"**Hook Pattern**")
+                rc2.code(current_pattern)
+            else:
+                # Anomaly path: model returned invalid type, require manual selection
+                st.warning("Hook pattern 未自动识别，请手动选择后才能保存。")
+                s.artifact["hook_pattern"] = rc2.selectbox(
+                    "Hook Pattern ⚠️",
+                    HOOK_PATTERNS,
+                )
+                pattern_valid = True
+
+            # Read-only confirmation fields
+            st.caption(f"**Topic Type:** `{s.artifact.get('topic_type')}` · "
+                      f"**Platform:** `{s.artifact.get('platform')}` · "
+                      f"**Format:** `{s.artifact.get('format')}`")
+            st.caption(f"**Hook:** {s.artifact.get('hook_text', '')}")
+
+            # Save — blocked if hook_pattern still invalid
+            can_save = pattern_valid and bool(s.artifact.get("hook_text", "").strip())
+            if st.button("④ 创建 Artifact", type="primary", disabled=not can_save):
+                artifact_id = insert_artifact(s.artifact)
+                st.success(f"Artifact 已创建：`{artifact_id}`。去拍。发完回来填 Performance。")
+                # Reset pipeline state
+                s.stage=1; s.idea=""; s.hooks=[]; s.script=None; s.storyboard=""
+                s.chosen_template=""; s.recs=[]
+                s.artifact = {
+                    "topic_type": TOPIC_TYPES[0],
+                    "platform": PLATFORMS[0],
+                    "format": "video_short",
+                    "structure": "process",
+                    "hook_pattern": None,
+                    "hook_text": "",
+                }
+        # ── End Artifact Review ────────────────────────────────────────────
 
 # ===== MEMORY =====
 with tab_mem:
