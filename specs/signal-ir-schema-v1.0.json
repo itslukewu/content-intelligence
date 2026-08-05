@@ -1,0 +1,251 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "signal-ir-schema-v1.0",
+  "title": "Signal IR",
+  "description": "Canonical intermediate representation for all research signals entering the Content Intelligence Opportunity Engine.",
+  "version": "1.0",
+  "type": "object",
+
+  "required": [
+    "signal_id",
+    "schema_version",
+    "source_type",
+    "extractor",
+    "signal_type",
+    "statement",
+    "topic",
+    "evidence",
+    "scores",
+    "observed_at",
+    "extracted_at"
+  ],
+
+  "properties": {
+
+    "signal_id": {
+      "type": "string",
+      "description": "Globally unique signal identifier.",
+      "minLength": 1
+    },
+
+    "schema_version": {
+      "type": "string",
+      "description": "Signal IR schema version.",
+      "const": "1.0"
+    },
+
+    "source_type": {
+      "type": "string",
+      "description": "High-level intelligence source category.",
+      "enum": ["creator", "audience", "founder", "knowledge", "trend", "performance"]
+    },
+
+    "source_platform": {
+      "type": "string",
+      "description": "Specific origin platform or system. Open string — not a closed enum.",
+      "minLength": 1
+    },
+
+    "source_ref": {
+      "type": "string",
+      "description": "Reference to the originating source item (URL, file path, DB row ID)."
+    },
+
+    "extractor": {
+      "type": "string",
+      "description": "Name and version of the Signal Extractor that produced this signal.",
+      "minLength": 1
+    },
+
+    "signal_type": {
+      "type": "string",
+      "description": "Semantic type of the signal. Extensible — unknown values must not cause errors downstream.",
+      "examples": [
+        "question", "pain", "confusion", "objection", "aspiration",
+        "desire", "resistance", "misconception", "language_pattern",
+        "emerging_topic", "saturated_topic", "content_pattern",
+        "narrative", "contrarian_view", "consensus", "format_pattern", "hook_pattern",
+        "insight", "lesson", "decision", "mistake", "observation",
+        "framework", "principle", "case_study", "analogy",
+        "validated_pattern", "anti_pattern", "performance_anomaly",
+        "audience_preference", "topic_performance", "format_performance", "hook_performance"
+      ],
+      "minLength": 1
+    },
+
+    "statement": {
+      "type": "string",
+      "description": "Atomic, human-readable claim or observation. One signal, one observation. Max 300 characters.",
+      "minLength": 1,
+      "maxLength": 300
+    },
+
+    "topic": {
+      "type": "string",
+      "description": "Primary normalized topic. Must be a reusable semantic category, not a description of the source item.",
+      "minLength": 1
+    },
+
+    "subtopic": {
+      "type": "string",
+      "description": "More precise subject within the topic."
+    },
+
+    "entities": {
+      "type": "array",
+      "description": "Products, people, companies, frameworks, or concepts referenced in the signal.",
+      "items": { "type": "string" }
+    },
+
+    "audience": {
+      "type": "array",
+      "description": "Audience segments this signal applies to.",
+      "items": { "type": "string" }
+    },
+
+    "evidence": {
+      "type": "object",
+      "description": "Evidence supporting the signal.",
+      "required": ["summary"],
+      "properties": {
+        "summary": {
+          "type": "string",
+          "description": "Human-readable explanation of the evidence. Max 1,000 characters.",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "excerpt": {
+          "type": "string",
+          "description": "Short excerpt preserving original source language. Max 500 characters.",
+          "maxLength": 500
+        },
+        "evidence_count": {
+          "type": "integer",
+          "description": "Number of source observations supporting this signal.",
+          "minimum": 0
+        },
+        "artifact_ids": {
+          "type": "array",
+          "description": "IDs of content artifacts related to this signal.",
+          "items": { "type": "string" }
+        },
+        "source_items": {
+          "type": "array",
+          "description": "References to originating source items.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "source_item_id": { "type": "string" },
+              "source_ref": { "type": "string" }
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "metrics": {
+      "type": "object",
+      "description": "Quantitative evidence. All fields optional.",
+      "properties": {
+        "frequency":        { "type": ["number", "null"], "description": "Number of times the signal appeared." },
+        "engagement":       { "type": ["number", "null"], "description": "Aggregate engagement associated with the signal." },
+        "growth_rate":      { "type": ["number", "null"], "description": "Change in frequency or engagement over time." },
+        "performance_lift": { "type": ["number", "null"], "description": "Improvement over a comparison baseline." },
+        "sample_size":      { "type": ["integer", "null"], "description": "Number of observations supporting the calculation.", "minimum": 0 },
+        "completion_rate":  { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "save_rate":        { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "share_rate":       { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "comment_rate":     { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+      },
+      "additionalProperties": true
+    },
+
+    "scores": {
+      "type": "object",
+      "description": "Normalized scores. All values 0.0–1.0. Only confidence is required.",
+      "required": ["confidence"],
+      "properties": {
+        "confidence": {
+          "type": "number",
+          "description": "How reliably was the signal extracted? Measures extraction quality, not opportunity quality.",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "relevance": {
+          "type": ["number", "null"],
+          "description": "How relevant is this to the creator's content pillars and target audience?",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "novelty": {
+          "type": ["number", "null"],
+          "description": "How different is this from existing signals and published content?",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "urgency": {
+          "type": ["number", "null"],
+          "description": "How quickly will this signal lose value if not acted on?",
+          "minimum": 0.0,
+          "maximum": 1.0
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "observed_at": {
+      "type": "string",
+      "description": "When the underlying signal was observed. ISO 8601.",
+      "format": "date-time"
+    },
+
+    "extracted_at": {
+      "type": "string",
+      "description": "When the Signal IR object was created by the extractor. ISO 8601.",
+      "format": "date-time"
+    },
+
+    "valid_until": {
+      "type": ["string", "null"],
+      "description": "Optional expiration. Opportunity Engine may penalize expired signals. ISO 8601.",
+      "format": "date-time"
+    },
+
+    "metadata": {
+      "type": "object",
+      "description": "Escape hatch for source-specific fields. Opportunity Engine must not depend on metadata fields.",
+      "additionalProperties": true
+    }
+
+  },
+
+  "additionalProperties": false,
+
+  "x-quality-gates": {
+    "description": "Recommended quality gates. Signals below confidence threshold may be stored but must not auto-enter the Opportunity Engine.",
+    "confidence_minimum": 0.60,
+    "statement_max_chars": 300,
+    "evidence_summary_max_chars": 1000,
+    "excerpt_max_chars": 500
+  },
+
+  "x-architectural-invariant": "The Opportunity Engine must operate only on Signal IR. It must never read raw source data (Reddit, performance_snapshots rows, Daily Review files, creator exports) directly.",
+
+  "x-versioning": {
+    "backward_compatible_changes": [
+      "New optional fields",
+      "New signal_type values",
+      "New source_platform strings",
+      "New metadata fields"
+    ],
+    "breaking_changes": [
+      "Removing required fields",
+      "Renaming core fields",
+      "Changing field semantics",
+      "Changing score ranges",
+      "Changing required types"
+    ],
+    "policy": "Backward-compatible changes increment minor version (1.x). Breaking changes require new major version (2.0)."
+  }
+}
