@@ -4,3 +4,4 @@ data/*.db-wal
 __pycache__/
 *.pyc
 *.pyo
+signals/*.jsonl
