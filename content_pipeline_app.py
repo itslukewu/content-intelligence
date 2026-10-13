@@ -662,7 +662,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_sig, tab_tmpl, tab_pipe, tab_mem = st.tabs(["信号收集", "模版库", "流水线", "Content Library"])
+from pipeline.topic_library_ui import render as render_topic_library
+
+tab_sig, tab_tmpl, tab_pipe, tab_mem, tab_topics = st.tabs(["信号收集", "模版库", "流水线", "Content Library", "Topic Library"])
+with tab_topics:
+    render_topic_library(ai_call=call_claude)
 
 # ===== SIGNAL COLLECTOR =====
 with tab_sig:
