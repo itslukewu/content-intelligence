@@ -25,6 +25,16 @@ ALLOWED = {
 }
 BRIEF_FIELDS = ('audience','pain_point','core_insight','hook','evidence','target_action','score_reasoning')
 AI_REQUIRED = BRIEF_FIELDS + ('quality_scores','priority_scores')
+SENSITIVE_PATTERNS = (
+    re.compile(r"sk-ant-[A-Za-z0-9_-]+"),
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"(?i)(api[_-]?key|authorization|bearer)\s*[:=]\s*['\"]?[^'\"\s,}]+"),
+)
+
+class AIBriefValidationError(ValueError):
+    def __init__(self, message, responses):
+        super().__init__(message)
+        self.responses=responses
 
 def connect(path):
     db=sqlite3.connect(path)
@@ -42,6 +52,64 @@ def _add_column(db, table, name, ddl):
     if _table_exists(db, table) and name not in _columns(db, table):
         db.execute(f'ALTER TABLE {table} ADD COLUMN {name} {ddl}')
 
+def _foreign_key_targets(db, table):
+    return {(row['from'], row['table'], row['to']) for row in db.execute(f'PRAGMA foreign_key_list({table})')}
+
+def _sanitize(value):
+    if value is None:
+        return ''
+    text=str(value)
+    for pattern in SENSITIVE_PATTERNS:
+        text=pattern.sub(lambda m: m.group(1)+'=[REDACTED]' if m.lastindex else '[REDACTED]', text)
+    return text
+
+def _ensure_topic_artifact_links_fk(db):
+    db.execute("""CREATE TABLE IF NOT EXISTS topic_artifact_link_migration_issues (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        topic_id TEXT,
+        artifact_id TEXT,
+        created_at TEXT,
+        reason TEXT NOT NULL,
+        detected_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )""")
+    if not _table_exists(db, 'topic_artifact_links'):
+        return {'migrated':False,'invalid_rows':[]}
+    targets=_foreign_key_targets(db, 'topic_artifact_links')
+    if ('artifact_id','content_artifacts','artifact_id') in targets:
+        return {'migrated':False,'invalid_rows':[]}
+    invalid=[dict(row) for row in db.execute("""
+        SELECT l.topic_id,l.artifact_id,l.created_at
+        FROM topic_artifact_links l
+        LEFT JOIN topics t ON t.topic_id=l.topic_id
+        LEFT JOIN content_artifacts a ON a.artifact_id=l.artifact_id
+        WHERE t.topic_id IS NULL OR a.artifact_id IS NULL
+    """)]
+    db.execute("DELETE FROM topic_artifact_link_migration_issues")
+    for row in invalid:
+        reason=[]
+        if not db.execute('SELECT 1 FROM topics WHERE topic_id=?',(row['topic_id'],)).fetchone():
+            reason.append('missing topic')
+        if not db.execute('SELECT 1 FROM content_artifacts WHERE artifact_id=?',(row['artifact_id'],)).fetchone():
+            reason.append('missing artifact')
+        db.execute(
+            "INSERT INTO topic_artifact_link_migration_issues(topic_id,artifact_id,created_at,reason) VALUES(?,?,?,?)",
+            (row['topic_id'], row['artifact_id'], row['created_at'], ', '.join(reason)),
+        )
+    db.execute('ALTER TABLE topic_artifact_links RENAME TO topic_artifact_links_legacy')
+    db.execute("""CREATE TABLE topic_artifact_links (
+        topic_id TEXT NOT NULL REFERENCES topics(topic_id) ON DELETE CASCADE,
+        artifact_id TEXT NOT NULL REFERENCES content_artifacts(artifact_id),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY(topic_id, artifact_id)
+    )""")
+    db.execute("""INSERT OR IGNORE INTO topic_artifact_links(topic_id,artifact_id,created_at)
+        SELECT l.topic_id,l.artifact_id,l.created_at
+        FROM topic_artifact_links_legacy l
+        JOIN topics t ON t.topic_id=l.topic_id
+        JOIN content_artifacts a ON a.artifact_id=l.artifact_id""")
+    db.execute('DROP TABLE topic_artifact_links_legacy')
+    return {'migrated':True,'invalid_rows':invalid}
+
 def init(db):
     base=ROOT.parent / 'specs' / 'schema_v1.0.sql'
     if base.exists():
@@ -57,9 +125,11 @@ def init(db):
     db.executescript((ROOT.parent / 'specs' / 'topic_library_v1.sql').read_text())
     _add_column(db, 'topics', 'score_reasoning', 'TEXT')
     _add_column(db, 'signals', 'velocity', 'TEXT')
+    migration=_ensure_topic_artifact_links_fk(db)
     db.execute('CREATE INDEX IF NOT EXISTS idx_topics_source_reference ON topics(source_reference)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_topic_status_history ON topic_status_history(topic_id, changed_at)')
     db.commit()
+    return migration
 
 def create(db,title,account='Unassigned',series=None,source_reference=None):
     tid='T-'+uuid.uuid4().hex[:12].upper()
@@ -141,7 +211,8 @@ def generate_ai_brief(ai_call, system_prompt, request, repair_prompt=None):
             obj=parse_ai_json(retry)
             return (*validate_ai_brief(obj), responses)
         except Exception as retry_error:
-            raise ValueError(f'AI JSON validation failed after retry: {first_error}; retry failed: {retry_error}') from retry_error
+            safe=[_sanitize(r) for r in responses]
+            raise AIBriefValidationError(f'AI JSON validation failed after retry: {first_error}; retry failed: {retry_error}', safe) from retry_error
 
 def gate_result(db, tid):
     row=db.execute("SELECT * FROM topic_scores WHERE topic_id=?", (tid,)).fetchone()

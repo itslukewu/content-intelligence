@@ -4,7 +4,7 @@ import streamlit as st
 from pipeline.settings import DB_PATH
 from pipeline.topic_library import (connect,create,score,transition,QUALITY,PRIORITY,ALLOWED,
                                     gate_result,update_brief,create_from_signal,
-                                    generate_ai_brief)
+                                    generate_ai_brief,AIBriefValidationError)
 LABELS=dict(zip(QUALITY+PRIORITY,['受众相关性','信息增量','证据质量','观点清晰','传播动机','叙事张力','账号匹配','用户需求','业务价值','制作可行性']))
 
 SYSTEM='''你是内容选题编辑。只依据提供的标题、来源和素材，不得编造个人经历、销量、金额或市场数据。输出严格 JSON 对象：audience,pain_point,core_insight,hook,evidence,target_action,score_reasoning,quality_scores,priority_scores。quality_scores 含 audience_relevance,information_gain,evidence_quality,clarity,share_motivation,narrative_tension,account_fit，0到5整数；priority_scores 含 demand,business_value,feasibility，1到3整数。缺乏证据时 evidence 写「待补充」，evidence_quality 不超过2；score_reasoning 简洁说明缺口。避免伪悬念和 AI can X but can it Y 句式。'''
@@ -73,6 +73,14 @@ def render(ai_call=None):
                             st.session_state[f'ai_draft_{chosen}']=obj
                             st.session_state[f'ai_scores_{chosen}']=values
                             st.success('AI 草稿已生成；审核后再保存')
+                        except AIBriefValidationError as e:
+                            responses=e.responses
+                            if responses:
+                                st.session_state[f'ai_raw_{chosen}']=responses[0]
+                            if len(responses)>1:
+                                st.session_state[f'ai_retry_raw_{chosen}']=responses[1]
+                            st.error(f'AI 分析失败：{e}')
+                            st.info('AI 原始响应已脱敏保留。可以展开下面的诊断信息，复制后检查；已保存的 Brief 和手动草稿不会受到影响。')
                         except Exception as e:
                             st.error(f'AI 分析失败：{e}')
                             st.info('AI 原始响应已保留。可以展开下面的诊断信息，复制后检查；已保存的 Brief 不会受到影响。')

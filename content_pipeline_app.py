@@ -30,7 +30,9 @@ from pipeline.constants import (
     TOPIC_TYPES, STRUCTURES, HOOK_PATTERNS, HOOK_PATTERN_DEFINITIONS,
     PLATFORMS, FORMATS,
 )
-from pipeline.topic_library import init as init_topic_library, link as link_topic_artifact
+from pipeline.topic_library import init as init_topic_library
+from pipeline.artifacts import insert_artifact as persist_artifact
+from pipeline.artifacts import insert_artifact_for_topic as persist_artifact_for_topic
 
 # ⬇️ 你的内容方向，所有 prompt 都引用这个变量
 CONTENT_DIRECTION = """
@@ -354,34 +356,6 @@ def init_db():
             conn.execute("ALTER TABLE signals ADD COLUMN velocity TEXT")
         init_topic_library(conn)
 
-def _next_content_id() -> str:
-    """Generate next content_id in CNT-YYYY-NNN format.
-    Derived from content_id column — never from artifact_id.
-    """
-    import datetime
-    year = datetime.date.today().year
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT content_id FROM content_artifacts "
-            "WHERE content_id LIKE ? "
-            "ORDER BY content_id DESC LIMIT 1",
-            (f"CNT-{year}-%",)
-        ).fetchone()
-    if row:
-        last_seq = int(row["content_id"].split("-")[2])
-        seq = last_seq + 1
-    else:
-        seq = 1
-    return f"CNT-{year}-{seq:03d}"
-
-
-def _platform_code(platform: str) -> str:
-    mapping = {"xiaohongshu": "XHS", "instagram": "IG"}
-    if platform not in mapping:
-        raise ValueError(f"Unknown platform '{platform}'. Add it to constants.PLATFORMS and _platform_code().")
-    return mapping[platform]
-
-
 def insert_artifact(a: dict) -> str:
     """
     Insert a content artifact. Generates content_id and artifact_id.
@@ -390,33 +364,11 @@ def insert_artifact(a: dict) -> str:
       platform, format, topic_type, structure, hook_pattern, hook_text
     Optional: secondary_topics, length, cta, series, language, publish_time, notes
     """
-    content_id = _next_content_id()
-    platform_code = _platform_code(a["platform"])
-    artifact_id = f"{content_id}-{platform_code}-01"
+    return persist_artifact(a)
 
-    with get_db() as conn:
-        conn.execute(
-            """INSERT INTO content_artifacts (
-                artifact_id, content_id, platform, format,
-                topic_type, structure, hook_pattern, hook_text,
-                secondary_topics, length, cta, series,
-                language, publish_time, notes
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                artifact_id, content_id,
-                a["platform"], a["format"],
-                a["topic_type"], a["structure"],
-                a["hook_pattern"], a["hook_text"],
-                a.get("secondary_topics"),
-                a.get("length"),
-                a.get("cta"),
-                a.get("series"),
-                a.get("language", "zh"),
-                a.get("publish_time"),
-                a.get("notes"),
-            )
-        )
-    return artifact_id
+
+def insert_artifact_for_topic(a: dict, topic_id=None) -> str:
+    return persist_artifact_for_topic(a, topic_id)
 
 
 def fetch_artifacts():
@@ -1050,24 +1002,22 @@ with tab_pipe:
             # Save — blocked if hook_pattern still invalid
             can_save = pattern_valid and bool(s.artifact.get("hook_text", "").strip())
             if st.button("④ 创建 Artifact", type="primary", disabled=not can_save):
-                artifact_id = insert_artifact(s.artifact)
-                if s.get("topic_active_id"):
-                    try:
-                        link_topic_artifact(get_db(), s.topic_active_id, artifact_id)
-                    except ValueError as e:
-                        st.warning(f"Artifact 已创建，但 Topic 关联失败：{e}")
-                st.success(f"Artifact 已创建：`{artifact_id}`。去拍。发完回来填 Performance。")
-                # Reset pipeline state
-                s.stage=1; s.idea=""; s.hooks=[]; s.script=None; s.storyboard=""
-                s.chosen_template=""; s.recs=[]; s.topic_active_id=None
-                s.artifact = {
-                    "topic_type": TOPIC_TYPES[0],
-                    "platform": PLATFORMS[0],
-                    "format": "video_short",
-                    "structure": "process",
-                    "hook_pattern": None,
-                    "hook_text": "",
-                }
+                try:
+                    artifact_id = insert_artifact_for_topic(s.artifact, s.get("topic_active_id"))
+                    st.success(f"Artifact 已创建：`{artifact_id}`。去拍。发完回来填 Performance。")
+                    # Reset pipeline state
+                    s.stage=1; s.idea=""; s.hooks=[]; s.script=None; s.storyboard=""
+                    s.chosen_template=""; s.recs=[]; s.topic_active_id=None
+                    s.artifact = {
+                        "topic_type": TOPIC_TYPES[0],
+                        "platform": PLATFORMS[0],
+                        "format": "video_short",
+                        "structure": "process",
+                        "hook_pattern": None,
+                        "hook_text": "",
+                    }
+                except ValueError as e:
+                    st.error(f"Artifact 未创建：{e}")
         # ── End Artifact Review ────────────────────────────────────────────
 
 # ===== CONTENT LIBRARY =====

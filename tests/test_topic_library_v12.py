@@ -1,5 +1,4 @@
 import json
-import shutil
 import sqlite3
 import sys
 from pathlib import Path
@@ -10,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from pipeline.topic_library import (
+    AIBriefValidationError,
     QUALITY,
     PRIORITY,
     connect,
@@ -24,6 +24,7 @@ from pipeline.topic_library import (
     update_brief,
     validate_ai_brief,
 )
+from pipeline.artifacts import insert_artifact_for_topic
 
 
 VALID_SCORES = {
@@ -55,10 +56,12 @@ def test_fresh_database_initialization(tmp_path):
 
 
 def test_migration_against_existing_database_preserves_records(tmp_path):
-    source = ROOT / "content_pipeline.db"
-    migrated = tmp_path / "legacy-copy.db"
-    shutil.copy(source, migrated)
-    db = connect(migrated)
+    db = connect(tmp_path / "legacy.db")
+    init(db)
+    db.execute(
+        "INSERT INTO content_artifacts(artifact_id,content_id,platform,format,topic_type,structure,hook_pattern,hook_text) VALUES(?,?,?,?,?,?,?,?)",
+        ("CNT-2026-001-XHS-01", "CNT-2026-001", "xiaohongshu", "video_short", "ai", "process", "problem", "hook"),
+    )
     before = db.execute("SELECT COUNT(*) AS n FROM content_artifacts").fetchone()["n"]
     init(db)
     after = db.execute("SELECT COUNT(*) AS n FROM content_artifacts").fetchone()["n"]
@@ -114,6 +117,20 @@ def test_ai_validation_rejects_invalid_scores():
     }
     with pytest.raises(ValueError, match="information_gain"):
         validate_ai_brief(invalid)
+
+
+def test_ai_failure_keeps_sanitized_diagnostics():
+    def ai_call(system, request):
+        if "格式修复器" in system:
+            return '{"still": "bad", "authorization": "Bearer sk-ant-retrySECRET"}'
+        return 'not json sk-ant-originalSECRET'
+
+    with pytest.raises(AIBriefValidationError) as exc:
+        generate_ai_brief(ai_call, "system", "request")
+    assert len(exc.value.responses) == 2
+    assert "sk-ant-originalSECRET" not in exc.value.responses[0]
+    assert "sk-ant-retrySECRET" not in exc.value.responses[1]
+    assert "[REDACTED]" in "\n".join(exc.value.responses)
 
 
 def test_editable_brief_persistence(tmp_path):
@@ -184,6 +201,45 @@ def test_topic_to_artifact_linking_supports_multiple_artifacts(tmp_path):
         )
         link(db, tid, artifact)
     assert db.execute("SELECT COUNT(*) AS n FROM topic_artifact_links WHERE topic_id=?", (tid,)).fetchone()["n"] == 2
+
+
+def test_legacy_topic_artifact_links_migration_reports_invalid_rows(tmp_path):
+    db = connect(tmp_path / "legacy-links.db")
+    init(db)
+    db.execute("PRAGMA foreign_keys=OFF")
+    db.executescript("""
+        DROP TABLE topic_artifact_links;
+        CREATE TABLE topic_artifact_links(topic_id TEXT NOT NULL REFERENCES topics(topic_id), artifact_id TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY(topic_id, artifact_id));
+        INSERT INTO topics(topic_id,title) VALUES('T-good','Good');
+        INSERT INTO content_artifacts(artifact_id,content_id,platform,format,topic_type,structure,hook_pattern,hook_text)
+        VALUES('CNT-2026-001-XHS-01','CNT-2026-001','xiaohongshu','video_short','ai','process','problem','hook');
+        INSERT INTO topic_artifact_links(topic_id,artifact_id) VALUES('T-good','CNT-2026-001-XHS-01');
+        INSERT INTO topic_artifact_links(topic_id,artifact_id) VALUES('T-good','missing-artifact');
+    """)
+    db.execute("PRAGMA foreign_keys=ON")
+    result = init(db)
+    fks = {(r["from"], r["table"], r["to"]) for r in db.execute("PRAGMA foreign_key_list(topic_artifact_links)")}
+    assert result["migrated"] is True
+    assert ("artifact_id", "content_artifacts", "artifact_id") in fks
+    assert db.execute("SELECT COUNT(*) AS n FROM topic_artifact_links").fetchone()["n"] == 1
+    issue = db.execute("SELECT artifact_id,reason FROM topic_artifact_link_migration_issues").fetchone()
+    assert issue["artifact_id"] == "missing-artifact"
+    assert "missing artifact" in issue["reason"]
+
+
+def test_atomic_artifact_linking_rolls_back_orphan_on_link_failure(tmp_path):
+    db = db_at(tmp_path)
+    artifact = {
+        "platform": "xiaohongshu",
+        "format": "video_short",
+        "topic_type": "ai",
+        "structure": "process",
+        "hook_pattern": "problem",
+        "hook_text": "hook",
+    }
+    with pytest.raises(ValueError, match="Unknown topic ID"):
+        insert_artifact_for_topic(artifact, "T-missing", tmp_path / "content_pipeline.db")
+    assert db.execute("SELECT COUNT(*) AS n FROM content_artifacts").fetchone()["n"] == 0
 
 
 def test_invalid_state_transition(tmp_path):
