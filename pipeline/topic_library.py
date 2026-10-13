@@ -1,9 +1,12 @@
-"""Topic Library v1.0 — SQLite CLI, Python standard library only."""
+"""Topic Library v1.2 — SQLite helpers, Python standard library only."""
 import argparse
 import json
+import re
 import sqlite3
 import uuid
 from pathlib import Path
+
+from pipeline.settings import DB_PATH
 
 ROOT = Path(__file__).resolve().parent
 QUALITY = ('audience_relevance','information_gain','evidence_quality','clarity','share_motivation','narrative_tension','account_fit')
@@ -20,6 +23,8 @@ ALLOWED = {
  'reviewed': set(),
  'paused': {'idea','pending_review'}
 }
+BRIEF_FIELDS = ('audience','pain_point','core_insight','hook','evidence','target_action','score_reasoning')
+AI_REQUIRED = BRIEF_FIELDS + ('quality_scores','priority_scores')
 
 def connect(path):
     db=sqlite3.connect(path)
@@ -27,8 +32,33 @@ def connect(path):
     db.execute('PRAGMA foreign_keys=ON')
     return db
 
+def _columns(db, table):
+    return {row['name'] for row in db.execute(f'PRAGMA table_info({table})')}
+
+def _table_exists(db, table):
+    return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+
+def _add_column(db, table, name, ddl):
+    if _table_exists(db, table) and name not in _columns(db, table):
+        db.execute(f'ALTER TABLE {table} ADD COLUMN {name} {ddl}')
+
 def init(db):
+    base=ROOT.parent / 'specs' / 'schema_v1.0.sql'
+    if base.exists():
+        db.executescript(base.read_text())
+    db.execute("""CREATE TABLE IF NOT EXISTS signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created TEXT, source_label TEXT, raw_text TEXT,
+        topic TEXT, pain TEXT, conflict TEXT,
+        module TEXT, priority TEXT, reason TEXT,
+        status TEXT DEFAULT 'new',
+        velocity TEXT
+    )""")
     db.executescript((ROOT.parent / 'specs' / 'topic_library_v1.sql').read_text())
+    _add_column(db, 'topics', 'score_reasoning', 'TEXT')
+    _add_column(db, 'signals', 'velocity', 'TEXT')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_topics_source_reference ON topics(source_reference)')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_topic_status_history ON topic_status_history(topic_id, changed_at)')
     db.commit()
 
 def create(db,title,account='Unassigned',series=None,source_reference=None):
@@ -56,6 +86,63 @@ def score(db,tid,values):
         db.execute("UPDATE topics SET insight_score=?,priority_score=?,priority=?,updated_at=datetime('now') WHERE topic_id=?",(q,p,tier,tid))
     return {'quality':q,'priority_score':p,'priority':tier,'quality_gate':gate}
 
+def _strip_code_fence(value):
+    value=value.strip()
+    match=re.fullmatch(r"```(?:json|JSON)?\s*(.*?)\s*```", value, flags=re.DOTALL)
+    return match.group(1).strip() if match else value
+
+def parse_ai_json(value):
+    return json.loads(_strip_code_fence(value))
+
+def validate_ai_brief(obj):
+    if not isinstance(obj, dict):
+        raise ValueError('AI response must be a JSON object')
+    missing=[k for k in AI_REQUIRED if k not in obj]
+    if missing:
+        raise ValueError('AI response missing fields: '+', '.join(missing))
+    normalized={}
+    for k in BRIEF_FIELDS:
+        if obj[k] is None:
+            normalized[k]=''
+        elif isinstance(obj[k], (str, int, float, bool)):
+            normalized[k]=str(obj[k]).strip()
+        else:
+            raise ValueError(f'AI field {k} must be text')
+    q=obj['quality_scores']
+    p=obj['priority_scores']
+    if not isinstance(q, dict) or not isinstance(p, dict):
+        raise ValueError('AI scores must be JSON objects')
+    values={}
+    for k in QUALITY:
+        if k not in q or type(q[k]) is not int or not 0 <= q[k] <= 5:
+            raise ValueError(f'Invalid quality score: {k}')
+        values[k]=q[k]
+    for k in PRIORITY:
+        if k not in p or type(p[k]) is not int or not 1 <= p[k] <= 3:
+            raise ValueError(f'Invalid priority score: {k}')
+        values[k]=p[k]
+    normalized['quality_scores']={k:values[k] for k in QUALITY}
+    normalized['priority_scores']={k:values[k] for k in PRIORITY}
+    return normalized, values
+
+def generate_ai_brief(ai_call, system_prompt, request, repair_prompt=None):
+    raw=ai_call(system_prompt, request)
+    responses=[raw]
+    try:
+        obj=parse_ai_json(raw)
+        normalized, values=validate_ai_brief(obj)
+        return normalized, values, responses
+    except Exception as first_error:
+        if repair_prompt is None:
+            repair_prompt='你是 JSON 格式修复器。仅返回一个合法 JSON 对象，不添加或编造内容；保持字段和值原意。'
+        retry=ai_call(repair_prompt, '将下面文本转换为合法 JSON；不要使用 Markdown 代码块，不要补充原文没有的信息：\n'+raw[:14000])
+        responses.append(retry)
+        try:
+            obj=parse_ai_json(retry)
+            return (*validate_ai_brief(obj), responses)
+        except Exception as retry_error:
+            raise ValueError(f'AI JSON validation failed after retry: {first_error}; retry failed: {retry_error}') from retry_error
+
 def gate_result(db, tid):
     row=db.execute("SELECT * FROM topic_scores WHERE topic_id=?", (tid,)).fetchone()
     if row is None:
@@ -69,7 +156,7 @@ def gate_result(db, tid):
 
 
 def update_brief(db,tid,fields):
-    allowed={'audience','pain_point','core_insight','hook','evidence','source_reference','series','format','platform','target_action','notes'}
+    allowed={'audience','pain_point','core_insight','hook','evidence','source_reference','series','format','platform','target_action','notes','score_reasoning'}
     if not fields or not set(fields)<=allowed: raise ValueError('Unsupported brief fields')
     if not db.execute('SELECT 1 FROM topics WHERE topic_id=?',(tid,)).fetchone(): raise ValueError('Unknown topic')
     with db:
@@ -110,7 +197,7 @@ def link(db,tid,artifact_id):
 
 def main():
     p=argparse.ArgumentParser()
-    p.add_argument('--db',required=True)
+    p.add_argument('--db',default=str(DB_PATH))
     sub=p.add_subparsers(dest='cmd',required=True)
     sub.add_parser('init')
     a=sub.add_parser('add');a.add_argument('title');a.add_argument('--account',default='Unassigned');a.add_argument('--series');a.add_argument('--source')

@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS topics (
  publish_url TEXT,
  pause_reason TEXT,
  notes TEXT,
+ score_reasoning TEXT,
  insight_score INTEGER CHECK(insight_score BETWEEN 0 AND 35),
  priority_score INTEGER CHECK(priority_score BETWEEN 3 AND 9)
 );
@@ -46,16 +47,25 @@ CREATE TABLE IF NOT EXISTS topic_scores (
  feasibility INTEGER NOT NULL CHECK(feasibility BETWEEN 1 AND 3),
  scored_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
--- Deliberately no FK to content_artifacts: legacy PK name is not verified.
 CREATE TABLE IF NOT EXISTS topic_artifact_links (
  topic_id TEXT NOT NULL REFERENCES topics(topic_id) ON DELETE CASCADE,
- artifact_id TEXT NOT NULL,
+ artifact_id TEXT NOT NULL REFERENCES content_artifacts(artifact_id),
  created_at TEXT NOT NULL DEFAULT (datetime('now')),
  PRIMARY KEY(topic_id, artifact_id)
+);
+CREATE TABLE IF NOT EXISTS topic_status_history (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ topic_id TEXT NOT NULL REFERENCES topics(topic_id) ON DELETE CASCADE,
+ from_status TEXT NOT NULL,
+ to_status TEXT NOT NULL,
+ override_reason TEXT,
+ changed_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_topics_status_priority ON topics(status, priority);
 CREATE INDEX IF NOT EXISTS idx_topics_account_series ON topics(account, series);
 CREATE INDEX IF NOT EXISTS idx_topics_publish_date ON topics(planned_publish_at);
+CREATE INDEX IF NOT EXISTS idx_topics_source_reference ON topics(source_reference);
+CREATE INDEX IF NOT EXISTS idx_topic_status_history ON topic_status_history(topic_id, changed_at);
 CREATE VIEW IF NOT EXISTS v_topic_queue AS
  SELECT topic_id,title,account,series,status,priority,insight_score,priority_score,planned_publish_at,owner
  FROM topics WHERE status IN ('approved','scheduled','in_production','qa');

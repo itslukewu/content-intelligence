@@ -30,6 +30,7 @@ from pipeline.constants import (
     TOPIC_TYPES, STRUCTURES, HOOK_PATTERNS, HOOK_PATTERN_DEFINITIONS,
     PLATFORMS, FORMATS,
 )
+from pipeline.topic_library import init as init_topic_library, link as link_topic_artifact
 
 # ⬇️ 你的内容方向，所有 prompt 都引用这个变量
 CONTENT_DIRECTION = """
@@ -335,7 +336,8 @@ def init_db():
             created TEXT, source_label TEXT, raw_text TEXT,
             topic TEXT, pain TEXT, conflict TEXT,
             module TEXT, priority TEXT, reason TEXT,
-            status TEXT DEFAULT 'new'
+            status TEXT DEFAULT 'new',
+            velocity TEXT
         )""")
 
         conn.execute("""CREATE TABLE IF NOT EXISTS templates (
@@ -347,6 +349,10 @@ def init_db():
             original_hook TEXT, full_breakdown TEXT,
             original_text TEXT
         )""")
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(signals)")}
+        if "velocity" not in cols:
+            conn.execute("ALTER TABLE signals ADD COLUMN velocity TEXT")
+        init_topic_library(conn)
 
 def _next_content_id() -> str:
     """Generate next content_id in CNT-YYYY-NNN format.
@@ -471,12 +477,21 @@ def insert_snapshot(s: dict):
 
 def insert_signal(sig, source_label, raw_text, velocity=None):
     with get_db() as conn:
+        existing = conn.execute(
+            """SELECT id FROM signals
+               WHERE source_label=? AND raw_text=? AND topic=? AND pain=? AND conflict=?
+               LIMIT 1""",
+            (source_label, raw_text, sig["topic"], sig["pain"], sig["conflict"]),
+        ).fetchone()
+        if existing:
+            return existing["id"], False
         conn.execute(
             "INSERT INTO signals (created,source_label,raw_text,topic,pain,conflict,module,priority,reason,velocity) "
             "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (date.today().isoformat(), source_label, raw_text,
              sig["topic"], sig["pain"], sig["conflict"],
              sig["module"], sig["priority"], sig["reason"], velocity))
+        return conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"], True
 
 def fetch_signals():
     with get_db() as conn:
@@ -635,6 +650,7 @@ def ss():
                  "sel": 0, "script": None, "storyboard": "", "sig_raw": "",
                  "sig_source": "", "sig_results": [], "chosen_template": "",
                  "tmpl_text": "", "tmpl_results": None, "recs": [],
+                 "topic_active_id": None,
                  # Artifact being built through the pipeline
                  "artifact": {
                      "topic_type": TOPIC_TYPES[0],
@@ -725,7 +741,8 @@ with tab_sig:
                     key=f"vel{i}", label_visibility="collapsed")
                 vel_val = vel.split(" ")[0]
                 if c1.button("存入信号库", key=f"ss{i}"):
-                    insert_signal(sig, source_label, collected_text[:500], velocity=vel_val); st.success("已存")
+                    _, created = insert_signal(sig, source_label, collected_text[:500], velocity=vel_val)
+                    st.success("已存" if created else "已存在，未重复导入")
                 if c2.button("做内容 →", key=f"su{i}"):
                     s.idea = sig["topic"]
                     for m in MODULES:
@@ -743,7 +760,7 @@ with tab_sig:
             st.caption(f"`{r['module']}` · {r['created']}")
             c1,c2,c3 = st.columns(3)
             if c1.button("做内容→", key=f"sbu{r['id']}"):
-                s.idea=r["topic"]; update_signal_status(r["id"],"used"); st.success("切到流水线")
+                s.idea=r["topic"]; s.topic_active_id=None; update_signal_status(r["id"],"used"); st.success("切到流水线")
             if c2.button("已用", key=f"sm{r['id']}"): update_signal_status(r["id"],"used"); st.rerun()
             if c3.button("删", key=f"sd{r['id']}"): delete_signal(r["id"]); st.rerun()
 
@@ -1034,10 +1051,15 @@ with tab_pipe:
             can_save = pattern_valid and bool(s.artifact.get("hook_text", "").strip())
             if st.button("④ 创建 Artifact", type="primary", disabled=not can_save):
                 artifact_id = insert_artifact(s.artifact)
+                if s.get("topic_active_id"):
+                    try:
+                        link_topic_artifact(get_db(), s.topic_active_id, artifact_id)
+                    except ValueError as e:
+                        st.warning(f"Artifact 已创建，但 Topic 关联失败：{e}")
                 st.success(f"Artifact 已创建：`{artifact_id}`。去拍。发完回来填 Performance。")
                 # Reset pipeline state
                 s.stage=1; s.idea=""; s.hooks=[]; s.script=None; s.storyboard=""
-                s.chosen_template=""; s.recs=[]
+                s.chosen_template=""; s.recs=[]; s.topic_active_id=None
                 s.artifact = {
                     "topic_type": TOPIC_TYPES[0],
                     "platform": PLATFORMS[0],

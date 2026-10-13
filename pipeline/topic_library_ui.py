@@ -3,7 +3,8 @@ import json
 import streamlit as st
 from pipeline.settings import DB_PATH
 from pipeline.topic_library import (connect,create,score,transition,QUALITY,PRIORITY,ALLOWED,
-                                    gate_result,update_brief,create_from_signal)
+                                    gate_result,update_brief,create_from_signal,
+                                    generate_ai_brief)
 LABELS=dict(zip(QUALITY+PRIORITY,['受众相关性','信息增量','证据质量','观点清晰','传播动机','叙事张力','账号匹配','用户需求','业务价值','制作可行性']))
 
 SYSTEM='''你是内容选题编辑。只依据提供的标题、来源和素材，不得编造个人经历、销量、金额或市场数据。输出严格 JSON 对象：audience,pain_point,core_insight,hook,evidence,target_action,score_reasoning,quality_scores,priority_scores。quality_scores 含 audience_relevance,information_gain,evidence_quality,clarity,share_motivation,narrative_tension,account_fit，0到5整数；priority_scores 含 demand,business_value,feasibility，1到3整数。缺乏证据时 evidence 写「待补充」，evidence_quality 不超过2；score_reasoning 简洁说明缺口。避免伪悬念和 AI can X but can it Y 句式。'''
@@ -44,15 +45,15 @@ def render(ai_call=None):
         status=f1.selectbox('状态',['全部']+list(ALLOWED))
         account_filter=f2.selectbox('账号',['全部','Luke 2.0','Amazon x AI','Unassigned'])
         filtered=[r for r in rows if (status=='全部' or r['status']==status) and (account_filter=='全部' or r['account']==account_filter)]
-        st.dataframe([{'标题':r['title'],'账号':r['account'],'状态':r['status'],'质量':r['insight_score'],'优先级':r['priority'],'Series':r['series']} for r in filtered],use_container_width=True,hide_index=True)
+        st.dataframe([{'标题':r['title'],'账号':r['account'],'状态':r['status'],'质量':r['insight_score'],'优先级':r['priority'],'Series':r['series']} for r in filtered],width='stretch',hide_index=True)
         if not filtered: return
         chosen=st.selectbox('查看 / 编辑选题',[r['topic_id'] for r in filtered],format_func=lambda tid:next(r['title'] for r in filtered if r['topic_id']==tid))
         row=next(r for r in filtered if r['topic_id']==chosen)
         gate=gate_result(db,chosen)
         st.caption(f"`{row['status']}` · 质量 {row['insight_score'] if row['insight_score'] is not None else '未评'}/35 · {row['priority'] or '未评'} · {gate['reason']}")
         with st.expander('Content Brief · 证据与观点',expanded=True):
-            fields=['audience','pain_point','core_insight','hook','evidence','target_action']
-            names=['目标受众','用户痛点','核心观点','Hook 草稿','真实证据 / 素材','目标动作']
+            fields=['audience','pain_point','core_insight','hook','evidence','target_action','score_reasoning']
+            names=['目标受众','用户痛点','核心观点','Hook 草稿','真实证据 / 素材','目标动作','AI 评分理由']
             with st.form('brief_v11'):
                 vals={k:st.text_area(label,value=row[k] or '',height=80) for k,label in zip(fields,names)}
                 if st.form_submit_button('保存 Brief'):
@@ -62,23 +63,12 @@ def render(ai_call=None):
                     with st.spinner('分析选题中…'):
                         try:
                             request=json.dumps({'title':row['title'],'account':row['account'],'series':row['series'],'source':row['source_reference'],'existing_brief':{k:row[k] for k in fields}},ensure_ascii=False)
-                            raw=ai_call(SYSTEM,request)
-                            st.session_state[f'ai_raw_{chosen}']=raw
-                            def parse_ai_json(value):
-                                value=value.strip()
-                                if value.startswith('```'):
-                                    value=value.split('\n',1)[-1].rsplit('```',1)[0].strip()
-                                return json.loads(value)
-                            try:
-                                obj=parse_ai_json(raw)
-                            except json.JSONDecodeError:
-                                # One bounded retry; never silently change or discard the raw answer.
-                                retry=ai_call('你是 JSON 格式修复器。仅返回一个合法 JSON 对象，不添加或编造内容；保持字段和值原意。',
-                                              '将下面文本转换为合法 JSON；不要使用 Markdown 代码块：\n'+raw[:14000])
-                                st.session_state[f'ai_retry_raw_{chosen}']=retry
-                                obj=parse_ai_json(retry)
-                            q=obj['quality_scores'];p=obj['priority_scores']
-                            values={k:int(q[k]) for k in QUALITY}|{k:int(p[k]) for k in PRIORITY}
+                            obj, values, responses=generate_ai_brief(ai_call, SYSTEM, request)
+                            st.session_state[f'ai_raw_{chosen}']=responses[0]
+                            if len(responses)>1:
+                                st.session_state[f'ai_retry_raw_{chosen}']=responses[1]
+                            else:
+                                st.session_state.pop(f'ai_retry_raw_{chosen}',None)
                             st.session_state.pop(f'ai_edit_{chosen}',None)
                             st.session_state[f'ai_draft_{chosen}']=obj
                             st.session_state[f'ai_scores_{chosen}']=values
@@ -95,16 +85,16 @@ def render(ai_call=None):
                 draft=st.session_state.get(f'ai_draft_{chosen}')
                 if draft:
                     st.markdown('#### 编辑 AI 草稿')
-                    st.caption('逐项修改后再保存。AI 不会自动覆盖你的编辑；修改后的内容会写入当前选题。')
+                    st.caption('AI 草稿尚未保存。逐项修改后再保存；重新生成不会自动覆盖已保存内容。')
                     draft_key=f'ai_edit_{chosen}'
                     if draft_key not in st.session_state:
-                        st.session_state[draft_key]={k:str(draft.get(k,'') or '') for k in fields+['score_reasoning']}
+                        st.session_state[draft_key]={k:str(draft.get(k,'') or '') for k in fields}
                     with st.form(f'ai_edit_form_{chosen}'):
-                        edited={k:st.text_area(label, value=st.session_state[draft_key].get(k,''), height=110 if k in ('evidence','score_reasoning') else 80, key=f'ai_edit_{chosen}_{k}') for k,label in zip(fields+['score_reasoning'],names+['AI 评分理由 / 可编辑'])}
+                        edited={k:st.text_area(label, value=st.session_state[draft_key].get(k,''), height=110 if k in ('evidence','score_reasoning') else 80, key=f'ai_edit_{chosen}_{k}') for k,label in zip(fields,names)}
                         save_edited=st.form_submit_button('保存修改后的 Brief 与 AI 初评分',type='primary')
                     if save_edited:
                         st.session_state[draft_key]=edited.copy()
-                        update_brief(db,chosen,{k:edited[k] for k in fields})
+                        update_brief(db,chosen,edited)
                         score(db,chosen,st.session_state[f'ai_scores_{chosen}'])
                         st.session_state.pop(f'ai_draft_{chosen}',None)
                         st.session_state.pop(draft_key,None)
